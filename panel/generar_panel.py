@@ -44,10 +44,9 @@ UMBRAL_MIN = 5  # minutos a partir de los que un tren cuenta como retrasado
 # Horarios estáticos: comprobados (funcionan).
 # Tiempo real:
 #   - Cercanías: gtfsrt.renfe.com/trip_updates.pb (confirmado en MobilityDatabase).
-#   - Larga/Media Distancia: la dirección NO está confirmada; se prueban varias
-#     candidatas en orden y se usa la primera que responda y encaje con el horario.
-#     Si ninguna sirve, esa tarjeta se omite. Busca la buena en https://data.renfe.com
-#     (conjunto "Actualizaciones de viaje de Alta Velocidad, Larga y Media Distancia").
+#   - Larga/Media Distancia: gtfsrt.renfe.com/trip_updates_LD.json (en formato JSON,
+#     confirmado en data.renfe.com). Se prueban las direcciones en orden y se usa la
+#     primera que responda y encaje con el horario; si ninguna sirve, se omite esa tarjeta.
 FUENTES = {
     "cercanias": {
         "gtfs_zip": "https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip",
@@ -56,9 +55,8 @@ FUENTES = {
     "larga": {  # Alta Velocidad, Larga y Media Distancia
         "gtfs_zip": "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip",
         "trip_updates": [
-            "https://gtfsrt.renfe.com/trip_updates_LD.pb",
-            "https://gtfsrt.renfe.com/trip_updates_ld.pb",
-            "https://gtfsrt.renfe.com/trip_updates_larga_distancia.pb",
+            "https://gtfsrt.renfe.com/trip_updates_LD.pb",    # probado: funciona con datos reales
+            "https://gtfsrt.renfe.com/trip_updates_LD.json",  # alternativa en JSON (data.renfe.com)
         ],
     },
 }
@@ -106,6 +104,14 @@ def clave_flexible(trip_id):
     t = re.sub(r"-?\d{4}-\d{2}-\d{2}$", "", trip_id or "")
     t = t.lstrip("0")
     return t
+
+
+def clave_nucleo(trip_id):
+    """Para identificadores de Cercanías tipo '4098M18094C6': (núcleo, resto) sin
+    los dos dígitos de versión. '4098M18094C6' y '4198M18094C6' dan la misma clave
+    ('40', 'M18094C6'); '5198M18094C6' no (otro núcleo)."""
+    m = re.match(r"^(\d{2})\d{2}(M\d+.*)$", trip_id or "")
+    return (m.group(1), m.group(2)) if m else None
 
 
 def hora_hhmm(valor):
@@ -228,33 +234,102 @@ def retraso_segundos(tu):
     return 0
 
 
+def _pick(d, *nombres):
+    """Primer valor presente entre varias grafías de una clave (snake_case / camelCase)."""
+    if isinstance(d, dict):
+        for n in nombres:
+            if n in d and d[n] is not None:
+                return d[n]
+    return None
+
+
+def _num(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def entradas_pb(contenido):
+    """Feed binario (protobuf): lista de (trip_id, retraso_en_segundos)."""
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(contenido)
+    return [(ent.trip_update.trip.trip_id, retraso_segundos(ent.trip_update))
+            for ent in feed.entity if ent.HasField("trip_update")]
+
+
+def entradas_json(datos):
+    """Feed en JSON: acepta la estructura GTFS-RT (snake_case o camelCase) o una
+    lista plana. Devuelve lista de (trip_id, retraso_en_segundos)."""
+    if isinstance(datos, dict):
+        ents = _pick(datos, "entity", "entities", "Entity") or []
+    else:
+        ents = datos or []
+    salida = []
+    for ent in ents:
+        tu = _pick(ent, "trip_update", "tripUpdate", "TripUpdate") or ent
+        trip = _pick(tu, "trip", "Trip") or tu
+        tid = _pick(trip, "trip_id", "tripId", "TripId")
+        if tid is None:
+            continue
+        delay = _num(_pick(tu, "delay", "Delay"))
+        if delay is None:
+            for stu in _pick(tu, "stop_time_update", "stopTimeUpdate", "StopTimeUpdate") or []:
+                for campo in ("arrival", "departure", "Arrival", "Departure"):
+                    d = _num(_pick(_pick(stu, campo), "delay", "Delay"))
+                    if d is not None:
+                        delay = d
+                        break
+                if delay is not None:
+                    break
+        salida.append((str(tid), delay or 0))
+    return salida
+
+
 def leer_tiempo_real(url, trips):
     """Devuelve (retrasos {trip_id_del_horario: minutos}, entidades_leidas,
     ejemplos_de_trip_id_del_feed)."""
-    feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(descargar(url))
+    contenido = descargar(url)
+    if url.lower().endswith(".json") or contenido.lstrip()[:1] in (b"{", b"["):
+        entradas = entradas_json(json.loads(contenido.decode("utf-8-sig")))
+    else:
+        entradas = entradas_pb(contenido)
+
+    if not entradas:
+        raise ValueError("el feed no contiene trenes con el formato esperado; primeros caracteres: %r"
+                         % contenido[:300])
 
     # Índice flexible: solo claves que identifican un único viaje del horario.
     flex = {}
     for tid in trips:
         flex.setdefault(clave_flexible(tid), []).append(tid)
 
-    retrasos, entidades, ejemplos = {}, 0, []
-    for ent in feed.entity:
-        if not ent.HasField("trip_update"):
-            continue
-        entidades += 1
-        rt_id = ent.trip_update.trip.trip_id
-        if len(ejemplos) < 5:
-            ejemplos.append(rt_id)
+    nuc = {}
+    for tid in trips:
+        k = clave_nucleo(tid)
+        if k:
+            nuc.setdefault(k, []).append(tid)
+
+    retrasos, ejemplos, por_nucleo = {}, [rt_id for rt_id, _ in entradas[:5]], 0
+    for rt_id, delay_s in entradas:
+        tid = None
         if rt_id in trips:
             tid = rt_id
         else:
             cand = flex.get(clave_flexible(rt_id), [])
-            tid = cand[0] if len(cand) == 1 and clave_flexible(rt_id) else None
+            if len(cand) == 1 and clave_flexible(rt_id):
+                tid = cand[0]
+            else:
+                k = clave_nucleo(rt_id)
+                cand = nuc.get(k, []) if k else []
+                if len(cand) == 1:
+                    tid = cand[0]
+                    por_nucleo += 1
         if tid is not None:
-            retrasos[tid] = max(0, round(retraso_segundos(ent.trip_update) / 60))
-    return retrasos, entidades, ejemplos
+            retrasos[tid] = max(0, round(delay_s / 60))
+    prefijos = Counter(re.match(r"\d{0,2}", r).group(0) for r, _ in entradas)
+    extra = {"por_clave_nucleo": por_nucleo, "prefijos_feed": prefijos.most_common(10)}
+    return retrasos, len(entradas), ejemplos, extra
 
 
 # ================================== PRINCIPAL ================================
@@ -306,7 +381,7 @@ def main():
         usado = False
         for url in cfg["trip_updates"]:
             try:
-                retrasos, entidades, ejemplos = leer_tiempo_real(url, trips)
+                retrasos, entidades, ejemplos, extra = leer_tiempo_real(url, trips)
             except Exception as e:
                 print("AVISO: %s no disponible (%s): %s" % (url, clave, e), file=sys.stderr)
                 continue
@@ -315,6 +390,10 @@ def main():
                 print("[diagnóstico %s] %s entidades=%d coincidencias=%d" % (clave, url, entidades, coinciden))
                 print("   ejemplos de trip_id en el feed:", ejemplos)
                 print("   ejemplos de trip_id en el horario:", list(trips)[:5])
+                print("   primeros dígitos de los trip_id del feed (cuántos de cada):", extra["prefijos_feed"])
+                print("   primeros dígitos de los trip_id del horario:",
+                      Counter(t[:2] for t in trips).most_common(10))
+                print("   casados por clave de núcleo:", extra["por_clave_nucleo"])
                 if retrasos:
                     print("   retraso máx=%d min, trenes >= %d min: %d"
                           % (max(retrasos.values()), UMBRAL_MIN,
