@@ -1,0 +1,56 @@
+name: Actualizar panel de trenes
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      diagnostico:
+        description: "Mostrar diagnóstico detallado en el registro"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: panel-trenes
+  cancel-in-progress: false
+
+jobs:
+  generar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: panel/requirements.txt
+
+      - run: pip install -r panel/requirements.txt
+
+      - name: Fecha de hoy (Madrid)
+        id: fecha
+        run: echo "d=$(TZ=Europe/Madrid date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Caché del horario estático (se renueva cada día)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: estatico-${{ steps.fecha.outputs.d }}
+
+      - name: Generar panel.json
+        run: python panel/generar_panel.py --salida salida/panel.json --cache cache/estatico.json ${{ inputs.diagnostico && '--diagnostico' || '' }}
+
+      - name: Publicar en la rama "datos"
+        run: |
+          cd salida
+          git init -q
+          git config user.name "panel-bot"
+          git config user.email "panel-bot@users.noreply.github.com"
+          git checkout -q -b datos
+          git add panel.json
+          git commit -q -m "Actualización $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" datos
