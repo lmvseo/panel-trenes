@@ -4,7 +4,7 @@ Genera panel.json con los trenes de Renfe con retraso que pasan por Valencia.
 
 Qué hace, en cada ejecución:
   1. Carga (o descarga una vez al día) el horario oficial GTFS de Renfe y se queda
-     con los trenes de hoy que pasan por una estación de Valencia.
+     con los trenes de hoy que pasan por una estación de València.
   2. Lee el feed oficial en tiempo real (GTFS-RT trip updates) y mira el retraso
      de cada uno de esos trenes.
   3. Escribe panel.json con el formato que espera el panel HTML.
@@ -14,7 +14,8 @@ Uso:
   python generar_panel.py --diagnostico      (muestra qué ha encontrado, para ajustar)
 
 Si no consigue datos fiables para ninguna tarjeta, termina con error y NO
-escribe panel.json, para no publicar números falsos.
+escribe panel.json, para no publicar números falsos. Si solo consigue algunas
+tarjetas (por ejemplo Cercanías sí y larga distancia no), publica solo esas.
 """
 import argparse
 import csv
@@ -40,17 +41,25 @@ except ImportError:  # permite importar el módulo sin la librería (solo para p
 ZONA = ZoneInfo("Europe/Madrid")
 UMBRAL_MIN = 5  # minutos a partir de los que un tren cuenta como retrasado
 
-# IMPORTANTE: las direcciones marcadas VERIFICAR no se han podido comprobar en
-# vivo al escribir este script. Si el diagnóstico da error 404, revisa la
-# dirección exacta en https://data.renfe.com
+# Horarios estáticos: comprobados (funcionan).
+# Tiempo real:
+#   - Cercanías: gtfsrt.renfe.com/trip_updates.pb (confirmado en MobilityDatabase).
+#   - Larga/Media Distancia: la dirección NO está confirmada; se prueban varias
+#     candidatas en orden y se usa la primera que responda y encaje con el horario.
+#     Si ninguna sirve, esa tarjeta se omite. Busca la buena en https://data.renfe.com
+#     (conjunto "Actualizaciones de viaje de Alta Velocidad, Larga y Media Distancia").
 FUENTES = {
     "cercanias": {
         "gtfs_zip": "https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip",
-        "trip_updates": "https://gtfsrt.renfe.com/trip_updates_cercanias.pb",  # VERIFICAR
+        "trip_updates": ["https://gtfsrt.renfe.com/trip_updates.pb"],
     },
     "larga": {  # Alta Velocidad, Larga y Media Distancia
-        "gtfs_zip": "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip",  # VERIFICAR
-        "trip_updates": "https://gtfsrt.renfe.com/trip_updates.pb",  # VERIFICAR
+        "gtfs_zip": "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip",
+        "trip_updates": [
+            "https://gtfsrt.renfe.com/trip_updates_LD.pb",
+            "https://gtfsrt.renfe.com/trip_updates_ld.pb",
+            "https://gtfsrt.renfe.com/trip_updates_larga_distancia.pb",
+        ],
     },
 }
 
@@ -61,11 +70,14 @@ TARJETAS = [
     ("ld", "Larga Distancia y Alta Velocidad"),
 ]
 
-# Un tren "pasa por Valencia" si alguna parada contiene "valencia" (sin acentos)...
+# Un tren "pasa por Valencia" si alguna parada contiene "valencia" (sin acentos,
+# así que cubre "València-...")...
 EXCLUIR_PARADAS = ("de alcantara", "don juan", "ventoso")  # ...salvo estas Valencias
 # Un tren del fichero AV/LD se considera Media Distancia si su nombre de ruta
-# contiene alguna de estas palabras (se ajusta con --diagnostico):
-PALABRAS_MD = {"md", "regional", "media"}
+# contiene alguna de estas palabras. Con los datos reales de hoy: REGIONAL y MD
+# van a Media Distancia; AVE, EUROMED, AVANT, AVLO, ALVIA, Intercity y REG.EXP.
+# van a Larga Distancia.
+PALABRAS_MD = {"md", "regional"}
 
 CABECERAS = {"User-Agent": "panel-trenes/1.0 (redaccion digital)"}
 
@@ -85,6 +97,15 @@ def es_parada_valencia(nombre):
 def es_media_distancia(corto, largo):
     tokens = set(re.findall(r"[a-z0-9]+", norm(corto + " " + largo)))
     return bool(tokens & PALABRAS_MD)
+
+
+def clave_flexible(trip_id):
+    """Forma simplificada de un trip_id para casar el horario con el tiempo real.
+    Quita una fecha final (AAAA-MM-DD) y los ceros a la izquierda:
+    '0046012026-10-27' -> '4601'."""
+    t = re.sub(r"-?\d{4}-\d{2}-\d{2}$", "", trip_id or "")
+    t = t.lstrip("0")
+    return t
 
 
 def hora_hhmm(valor):
@@ -208,18 +229,32 @@ def retraso_segundos(tu):
 
 
 def leer_tiempo_real(url, trips):
-    """Devuelve (retrasos {trip_id: minutos}, entidades_leidas, coincidencias)."""
+    """Devuelve (retrasos {trip_id_del_horario: minutos}, entidades_leidas,
+    ejemplos_de_trip_id_del_feed)."""
     feed = gtfs_realtime_pb2.FeedMessage()
     feed.ParseFromString(descargar(url))
-    retrasos, entidades = {}, 0
+
+    # Índice flexible: solo claves que identifican un único viaje del horario.
+    flex = {}
+    for tid in trips:
+        flex.setdefault(clave_flexible(tid), []).append(tid)
+
+    retrasos, entidades, ejemplos = {}, 0, []
     for ent in feed.entity:
         if not ent.HasField("trip_update"):
             continue
         entidades += 1
-        tid = ent.trip_update.trip.trip_id
-        if tid in trips:
+        rt_id = ent.trip_update.trip.trip_id
+        if len(ejemplos) < 5:
+            ejemplos.append(rt_id)
+        if rt_id in trips:
+            tid = rt_id
+        else:
+            cand = flex.get(clave_flexible(rt_id), [])
+            tid = cand[0] if len(cand) == 1 and clave_flexible(rt_id) else None
+        if tid is not None:
             retrasos[tid] = max(0, round(retraso_segundos(ent.trip_update) / 60))
-    return retrasos, entidades, len(retrasos)
+    return retrasos, entidades, ejemplos
 
 
 # ================================== PRINCIPAL ================================
@@ -254,41 +289,51 @@ def main():
             trips, diag = procesar_estatico(descargar(cfg["gtfs_zip"]), hoy, clave == "cercanias")
             cache["fuentes"][clave] = trips
             if args.diagnostico:
-                print("[diagnóstico %s]" % clave, json.dumps(diag, ensure_ascii=False, indent=2))
+                print("[diagnóstico %s]" % clave, json.dumps(diag, ensure_ascii=False))
         except Exception as e:
             print("AVISO: no se pudo procesar el horario de %s: %s" % (clave, e), file=sys.stderr)
     os.makedirs(os.path.dirname(args.cache) or ".", exist_ok=True)
     with open(args.cache, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False)
 
-    # 2) tiempo real
+    # 2) tiempo real: para cada fuente se prueban sus direcciones en orden y se
+    #    usa la primera que responda y cuyos trenes encajen con el horario.
     grupos = {}
     for clave, cfg in FUENTES.items():
         trips = cache["fuentes"].get(clave)
         if not trips:
             continue
-        try:
-            retrasos, entidades, coinciden = leer_tiempo_real(cfg["trip_updates"], trips)
-        except Exception as e:
-            print("AVISO: feed en tiempo real de %s no disponible: %s" % (clave, e), file=sys.stderr)
-            continue
-        if args.diagnostico:
-            print("[diagnóstico %s] entidades=%d coincidencias=%d (ejemplo trip_id horario: %s)"
-                  % (clave, entidades, coinciden, next(iter(trips), "-")))
-            if retrasos:
-                print("   retraso máx=%d min, trenes >= %d min: %d"
-                      % (max(retrasos.values()), UMBRAL_MIN, sum(1 for v in retrasos.values() if v >= UMBRAL_MIN)))
-        if coinciden == 0:
-            print("AVISO: ningún trip_id del feed coincide con el horario (%s); se omite la tarjeta." % clave,
-                  file=sys.stderr)
-            continue
-        for t in trips.values():
-            grupos.setdefault(t["grupo"], {"total": 0, "trenes": []})["total"] += 1
-        for tid, minutos in retrasos.items():
-            if minutos >= UMBRAL_MIN:
-                t = trips[tid]
-                grupos[t["grupo"]]["trenes"].append(
-                    {"linea": t["linea"], "hora": t["hora"], "destino": t["destino"], "retraso": minutos})
+        usado = False
+        for url in cfg["trip_updates"]:
+            try:
+                retrasos, entidades, ejemplos = leer_tiempo_real(url, trips)
+            except Exception as e:
+                print("AVISO: %s no disponible (%s): %s" % (url, clave, e), file=sys.stderr)
+                continue
+            coinciden = len(retrasos)
+            if args.diagnostico:
+                print("[diagnóstico %s] %s entidades=%d coincidencias=%d" % (clave, url, entidades, coinciden))
+                print("   ejemplos de trip_id en el feed:", ejemplos)
+                print("   ejemplos de trip_id en el horario:", list(trips)[:5])
+                if retrasos:
+                    print("   retraso máx=%d min, trenes >= %d min: %d"
+                          % (max(retrasos.values()), UMBRAL_MIN,
+                             sum(1 for v in retrasos.values() if v >= UMBRAL_MIN)))
+            if coinciden == 0:
+                print("AVISO: ningún tren de %s coincide con el horario de %s." % (url, clave),
+                      file=sys.stderr)
+                continue
+            for t in trips.values():
+                grupos.setdefault(t["grupo"], {"total": 0, "trenes": []})["total"] += 1
+            for tid, minutos in retrasos.items():
+                if minutos >= UMBRAL_MIN:
+                    t = trips[tid]
+                    grupos[t["grupo"]]["trenes"].append(
+                        {"linea": t["linea"], "hora": t["hora"], "destino": t["destino"], "retraso": minutos})
+            usado = True
+            break
+        if not usado:
+            print("AVISO: sin tiempo real fiable para %s; se omiten sus tarjetas." % clave, file=sys.stderr)
 
     servicios = []
     for grupo, nombre in TARJETAS:
