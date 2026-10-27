@@ -332,6 +332,33 @@ def leer_tiempo_real(url, trips):
     return retrasos, len(entradas), ejemplos, extra
 
 
+# ===================== SONDEO DE OTRAS FUENTES (solo diagnóstico) ============
+SONDEO = [
+    "https://gtfsrt.renfe.com/vehicle_positions.pb",
+    "https://gtfsrt.renfe.com/vehicle_positions.json",
+    "https://gtfsrt.renfe.com/trip_updates.json",
+    "https://gtfsrt.renfe.com/alerts.pb",
+    "https://gtfsrt.renfe.com/alerts.json",
+    "https://tiempo-real.renfe.com/renfe-visor/trenesCercanias.json",
+]
+
+
+def sondear_cercanias():
+    """Busca en otras direcciones de Renfe trenes del núcleo 40 (Valencia).
+    Funciona con cualquier formato: busca el texto de los identificadores en bruto."""
+    print("[sondeo de otras fuentes de Cercanías: ¿aparece el núcleo 40 (Valencia)?]")
+    for url in SONDEO:
+        try:
+            c = descargar(url)
+        except Exception as e:
+            print("   %s -> sin acceso: %s" % (url, e))
+            continue
+        ids = re.findall(rb"(?<![0-9])40\d{2}M\d+[A-Za-z0-9]*", c)
+        val = len(re.findall(rb"Val(?:e|\xc3\xa8)ncia", c, re.I))
+        print("   %s -> %d bytes; trenes del núcleo 40: %d (ej. %s); menciones a Valencia: %d; inicio: %r"
+              % (url, len(c), len(set(ids)), [i.decode() for i in list(dict.fromkeys(ids))[:3]], val, c[:100]))
+
+
 # ================================== PRINCIPAL ================================
 def main():
     ap = argparse.ArgumentParser()
@@ -413,6 +440,9 @@ def main():
             break
         if not usado:
             print("AVISO: sin tiempo real fiable para %s; se omiten sus tarjetas." % clave, file=sys.stderr)
+
+    if args.diagnostico:
+        sondear_cercanias()
 
     servicios = []
     for grupo, nombre in TARJETAS:
